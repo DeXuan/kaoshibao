@@ -1991,17 +1991,39 @@ def save_to_excel(questions: list[dict[str, Any]], filepath: str) -> None:
 
 
 def _normalize_options(opts) -> list[str]:
-    """统一选项为列表形式"""
+    """统一选项为列表形式，并去掉重复的选项字母前缀。
+
+    DOM 抓到的选项常是 "A\\nA\\n使挡板开度与输入信号成比例"（字母被渲染两次），
+    也可能是 "A\\n内容" 或 "A. 内容"。这里统一剥掉开头的字母行/字母前缀。
+
+    特殊情况：选项纯图片时 DOM 里只有 "A\\nA"，剥完会变空。
+    这种题不能当成"没有选项"，否则核对会误判。保留一个占位标记。
+    """
     if isinstance(opts, str):
         opts = [o.strip() for o in opts.split('\n') if o.strip()]
     cleaned_list = []
-    for opt in (opts or []):
-        cleaned = opt
-        if len(cleaned) > 2 and cleaned[0] in 'ABCDEF' and cleaned[1] in '.、 ':
-            cleaned = cleaned[2:].strip()
-        elif len(cleaned) > 3 and cleaned[0] in 'ABCDEF' and cleaned[1:3] in ['. ', '、 ']:
-            cleaned = cleaned[3:].strip()
-        cleaned_list.append(cleaned)
+    for idx, opt in enumerate(opts or []):
+        s = (opt or '').strip()
+        if not s:
+            continue
+        raw = s
+        # 逐行剥掉开头的纯字母行（A / B / C ...）
+        lines = s.split('\n')
+        while lines and len(lines[0].strip()) <= 2 and lines[0].strip()[:1] in 'ABCDEF' and lines[0].strip()[1:].strip() in ('', '.', '、', '．'):
+            lines.pop(0)
+        s = '\n'.join(lines).strip()
+        # 再剥一次行内前缀 "A. " / "A、"
+        if len(s) > 2 and s[0] in 'ABCDEF' and s[1] in '.、．':
+            s = s[2:].strip()
+        elif len(s) > 3 and s[0] in 'ABCDEF' and s[1] == ' ':
+            s = s[2:].strip()
+        s = s.strip()
+        if s:
+            cleaned_list.append(s)
+        else:
+            # 剥完为空 = 该选项只有图片（内容在图里），保留占位防止误判"无选项"
+            letter = 'ABCDEF'[idx] if idx < 6 else str(idx + 1)
+            cleaned_list.append(f'（选项{letter}见配图）')
     return cleaned_list
 
 
