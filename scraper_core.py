@@ -2043,6 +2043,225 @@ def save_to_json(questions: list[dict[str, Any]], filepath: str) -> None:
         json.dump(structured, f, ensure_ascii=False, indent=2)
 
 
+# ---------------- 图片下载缓存 ----------------
+
+IMG_CACHE_DIR = DATA_DIR / "images"
+
+
+def _img_cache_path(url: str):
+    """按 URL 生成稳定的本地缓存路径。"""
+    import hashlib
+    from urllib.parse import urlparse
+    h = hashlib.md5(url.encode()).hexdigest()
+    ext = '.jpg'
+    try:
+        p = urlparse(url).path
+        if '.' in p.rsplit('/', 1)[-1]:
+            ext = '.' + p.rsplit('.', 1)[-1].lower()
+            if ext not in ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'):
+                ext = '.jpg'
+    except Exception:
+        pass
+    return IMG_CACHE_DIR / f"{h}{ext}"
+
+
+def _download_image(url: str, referer: str = 'https://www.kaoshibao.com/') -> str | None:
+    """下载题目图片到本地缓存，返回本地路径；失败返回 None。
+
+    考试宝的图挂在 up.zaixiankaoshi.com，可能需要 Referer，所以带上。
+    """
+    if not url or not url.startswith(('http://', 'https://')):
+        return None
+    IMG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    dest = _img_cache_path(url)
+    if dest.exists() and dest.stat().st_size > 0:
+        return str(dest)
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                          'AppleWebKit/537.36 (KHTML, like Gecko) '
+                          'Chrome/120.0.0.0 Safari/537.36',
+            'Referer': referer,
+        })
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = r.read()
+        if len(data) < 64:
+            return None
+        dest.write_bytes(data)
+        return str(dest)
+    except Exception as e:
+        logger.warning(f"图片下载失败 {url}: {e}")
+        return None
+
+
+def _prepare_images(questions, log_fn=None) -> int:
+    """批量下载所有题目图片，返回成功数量。"""
+    total = 0
+    seen = set()
+    for q in questions:
+        for key in ('图片', '解析图片'):
+            for im in q.get(key) or []:
+                url = im.get('src') if isinstance(im, dict) else im
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                if _download_image(url):
+                    total += 1
+        for group in q.get('选项图片') or []:
+            for im in group.get('images') or []:
+                url = im.get('src') if isinstance(im, dict) else im
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                if _download_image(url):
+                    total += 1
+    if log_fn and total:
+        log_fn(f"已下载 {total} 张题目配图")
+    return total
+
+
+def _clean_analysis(text: str) -> str:
+    """清理解析里的页面噪声：AI 声明、难度星级文字、按钮文案等。"""
+    if not text:
+        return ''
+    import re as _re
+    s = text
+    # 去掉 AI 声明整行
+    s = _re.sub(r'本解析由\s*AI\s*生成[，,]?\s*仅供参考[。.]?', '', s)
+    s = _re.sub(r'使用深度解题获取深度思考过程[。.]?', '', s)
+    # 去掉孤零零的「难」「度」「中」「易」行（难度星级被 OCR/DOM 拆成单字）
+    s = _re.sub(r'(?m)^\s*[难度中易]\s*$', '', s)
+    # 去掉重复空行
+    s = _re.sub(r'\n{3,}', '\n\n', s)
+    # 去掉「获取深度解题」等按钮残留
+    for w in ('获取深度解题', '深度解题', '关闭AI解析', '原解析', 'AI解析'):
+        s = s.replace(w, '')
+    return s.strip()
+
+
+def save_to_docx(questions: list[dict[str, Any]], filepath: str,
+                 title: str = '', log_fn=None) -> None:
+    """导出为 Word (.docx)，题目配图内嵌。
+
+    结构：
+      标题
+      每道题：序号 + 题型 + 题干（含图） + 选项 A~F + 正确答案 + 解析（含图）
+    """
+    from docx import Document
+    from docx.shared import Pt, Inches, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+
+    doc = Document()
+
+    # 中文字体
+    style = doc.styles['Normal']
+    style.font.name = '微软雅黑'
+    style.font.size = Pt(10.5)
+    style.element.rPr.rFonts.set(qn('w:eastAsia'), '微软雅黑')
+
+    if title:
+        h = doc.add_heading(title, level=0)
+        h.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    ok_imgs = 0
+    miss_imgs = 0
+
+    def add_images(img_list, indent=0.0):
+        nonlocal ok_imgs, miss_imgs
+        for im in img_list or []:
+            url = im.get('src') if isinstance(im, dict) else im
+            if not url:
+                continue
+            local = _download_image(url)
+            if not local:
+                miss_imgs += 1
+                p = doc.add_paragraph()
+                if indent:
+                    p.paragraph_format.left_indent = Inches(indent)
+                run = p.add_run(f'[图片下载失败: {url}]')
+                run.font.size = Pt(8)
+                run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+                continue
+            try:
+                w = im.get('w', 0) if isinstance(im, dict) else 0
+                # 按原始像素决定插入宽度，最大 5.5 英寸
+                width = Inches(5.5)
+                if w and w < 700:
+                    width = Inches(max(1.5, min(5.5, w / 96)))
+                p = doc.add_paragraph()
+                if indent:
+                    p.paragraph_format.left_indent = Inches(indent)
+                p.add_run().add_picture(local, width=width)
+                ok_imgs += 1
+            except Exception as e:
+                logger.warning(f"插入图片失败 {local}: {e}")
+                miss_imgs += 1
+
+    for q in questions:
+        # 题干行
+        p = doc.add_paragraph()
+        p.paragraph_format.space_before = Pt(10)
+        r = p.add_run(f"{q.get('序号', '')}. ")
+        r.bold = True
+        qtype = q.get('题目类型', '')
+        if qtype:
+            tr = p.add_run(f"【{qtype}】")
+            tr.font.size = Pt(9)
+            tr.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
+        p.add_run(q.get('题目', ''))
+
+        # 题干配图
+        add_images(q.get('图片'))
+
+        # 选项
+        opts = _normalize_options(q.get('选项', []))
+        opt_imgs = {}
+        for group in q.get('选项图片') or []:
+            opt_imgs[group.get('index')] = group.get('images') or []
+        letters = 'ABCDEFGHIJ'
+        for i, opt in enumerate(opts):
+            op = doc.add_paragraph()
+            op.paragraph_format.left_indent = Inches(0.3)
+            op.paragraph_format.space_after = Pt(2)
+            op.add_run(f"{letters[i] if i < len(letters) else i + 1}. {opt}")
+            if i in opt_imgs:
+                add_images(opt_imgs[i], indent=0.45)
+
+        # 答案
+        ans = q.get('正确答案', '')
+        if ans:
+            ap = doc.add_paragraph()
+            ap.paragraph_format.left_indent = Inches(0.3)
+            ar = ap.add_run(f"正确答案：{ans}")
+            ar.bold = True
+            ar.font.color.rgb = RGBColor(0xC0, 0x00, 0x00)
+
+        # 解析
+        anal = _clean_analysis(q.get('解析') or '')
+        if anal:
+            anp = doc.add_paragraph()
+            anp.paragraph_format.left_indent = Inches(0.3)
+            anr = anp.add_run("解析：")
+            anr.bold = True
+            anr.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
+            anp.add_run(anal)
+        add_images(q.get('解析图片'), indent=0.3)
+
+        # 分隔线
+        sep = doc.add_paragraph()
+        sep.paragraph_format.space_after = Pt(4)
+        sr = sep.add_run('─' * 40)
+        sr.font.size = Pt(8)
+        sr.font.color.rgb = RGBColor(0xDD, 0xDD, 0xDD)
+
+    doc.save(filepath)
+    if log_fn:
+        log_fn(f"Word 导出完成：内嵌图片 {ok_imgs} 张"
+               + (f"，{miss_imgs} 张失败" if miss_imgs else ""))
+
+
 def export_questions(questions: list[dict[str, Any]], filepath: str, fmt: str = 'xlsx') -> None:
     """统一导出入口：根据格式调用对应保存函数"""
     fmt = (fmt or 'xlsx').lower()
@@ -2050,6 +2269,8 @@ def export_questions(questions: list[dict[str, Any]], filepath: str, fmt: str = 
         save_to_csv(questions, filepath)
     elif fmt == 'json':
         save_to_json(questions, filepath)
+    elif fmt in ('docx', 'word'):
+        save_to_docx(questions, filepath)
     else:
         save_to_excel(questions, filepath)
 
