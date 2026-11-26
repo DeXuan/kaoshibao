@@ -606,6 +606,53 @@ async def enable_recite_mode(page) -> bool:
     return enabled
 
 
+async def force_show_answer(page) -> bool:
+    """强制显示正确答案。
+
+    回抓缺失答案时用：先确保背题模式开着（背题模式会直接给答案），
+    再兜底点击"查看答案/查看解析"。
+    """
+    # 1) 已有答案就别折腾
+    try:
+        has = await page.evaluate('''() => {
+            if (document.querySelector('.option.right')) return true;
+            const t = document.body.innerText || '';
+            return t.includes('正确答案');
+        }''')
+        if has:
+            return True
+    except Exception:
+        pass
+
+    # 2) 开背题模式
+    try:
+        await enable_recite_mode(page)
+        await asyncio.sleep(1)
+    except Exception:
+        pass
+
+    # 3) 兜底点击查看答案按钮
+    try:
+        clicked = await page.evaluate('''() => {
+            const words = ['查看答案', '查看解析', '显示答案', '确定', '提交'];
+            const els = document.querySelectorAll('button, .btn, a, [role="button"], span, div');
+            for (const el of els) {
+                const txt = (el.innerText || '').trim();
+                if (txt && txt.length <= 6 && words.includes(txt) && el.offsetParent !== null) {
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        }''')
+        if clicked:
+            await asyncio.sleep(1.5)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 async def wait_for_question(page, timeout=10) -> bool:
     """等待题目元素出现（包含modal中的题目）"""
     selectors = [
@@ -1568,7 +1615,8 @@ async def _recover_page(page, paper_id, questions: list, log_fn=None) -> bool:
 
 async def collect_questions(page, paper_id, log_fn=None, stop_check=None, progress_fn=None,
                            start_sequence=0, max_questions=0, mode='ocr',
-                           existing_questions=None, repeat_limit=10) -> tuple[list[dict[str, Any]], str]:
+                           existing_questions=None, repeat_limit=10,
+                           audit_fix=True) -> tuple[list[dict[str, Any]], str]:
     """
     背题模式下收集所有题目+答案+解析
 
@@ -1581,6 +1629,7 @@ async def collect_questions(page, paper_id, log_fn=None, stop_check=None, progre
         start_sequence: 起始题目序号（用于分段并行）
         max_questions: 最多收集题目数（0=不限）
         existing_questions: 已有进度（用于去重，仅新增缺失题）
+        audit_fix: 收集结束后核对每题选项/答案，缺的回抓补全
     """
     questions = []
     existing_keys = set()
@@ -1726,6 +1775,36 @@ async def collect_questions(page, paper_id, log_fn=None, stop_check=None, progre
         has_ans = sum(1 for q in questions if q.get('正确答案'))
         log(f"完成: {len(questions)} 题, 有答案 {has_ans} 题")
 
+        # ===== 完整性核对 + 自动回抓缺失项 =====
+        if audit_fix and questions:
+            report = audit_questions(questions)
+            if report['bad'] > 0:
+                log(f"核对发现 {report['bad']} 道题缺选项/答案，开始回抓...")
+                targets = []
+                for item in report['bad_list']:
+                    seq = item['序号']
+                    orig = next((x for x in questions if x.get('序号') == seq), None)
+                    if orig is not None:
+                        targets.append({'序号': seq, '缺失': item['缺失'], '_orig': orig})
+                res = await rescrape_questions(
+                    page, paper_id, targets, len(questions),
+                    log_fn=log_fn, stop_check=stop_check, mode=mode,
+                )
+                # 回抓后再次核对
+                report2 = audit_questions(questions)
+                log(f"回抓后核对：完整 {report2['ok']}/{report2['total']}，"
+                    f"仍缺 {report2['bad']} 道")
+                try:
+                    save_progress(paper_id, questions,
+                                  suffix=f'_{mode}' if mode and mode != 'ocr' else '')
+                except Exception:
+                    pass
+                if report2['bad'] > 0:
+                    log("仍有题目缺项，可稍后用「核对补全」按钮重试："
+                        + ', '.join(str(b['序号']) for b in report2['bad_list'][:20]))
+            else:
+                log(f"核对通过：{report['total']} 道题选项/答案齐全")
+
         # 分段模式：未达上限且非正常结束（翻题失败/恢复失败等），标记 error 触发重试
         if max_questions > 0 and not normal_end and len(questions) < max_questions:
             log(f"分段未达上限: 已收集 {len(questions)}/{max_questions} 题，标记为需重试")
@@ -1737,6 +1816,135 @@ async def collect_questions(page, paper_id, log_fn=None, stop_check=None, progre
         return questions, 'error'
 
     return questions, 'ok'
+
+
+def check_question_complete(q: dict) -> tuple[bool, list[str]]:
+    """核对单题是否完整：选项 + 答案。
+
+    返回 (是否完整, 缺失项列表)。
+    - 单选题/多选题：必须有 正确答案，且选项 >= 2 个（或选项图）
+    - 判断题：有答案即可
+    - 填空题/简答：只要题干和答案
+    """
+    missing = []
+    qtype = (q.get('题目类型') or '')
+    question = (q.get('题目') or '').strip()
+    opts = _normalize_options(q.get('选项') or [])
+    ans = (q.get('正确答案') or '').strip()
+
+    if not question:
+        missing.append('题干')
+
+    if not ans:
+        missing.append('答案')
+
+    # 需要选项的题型
+    need_opt = any(k in qtype for k in ('单选', '多选', '不定项', '选择'))
+    if need_opt:
+        has_opt_img = bool(q.get('选项图片'))
+        if len(opts) < 2 and not has_opt_img:
+            missing.append('选项')
+
+    return (len(missing) == 0, missing)
+
+
+def audit_questions(questions: list[dict]) -> dict:
+    """全量核对，返回缺失统计与待重抓清单。"""
+    bad = []
+    for q in questions:
+        ok, miss = check_question_complete(q)
+        if not ok:
+            bad.append({'序号': q.get('序号'), '题目': (q.get('题目') or '')[:60],
+                        '缺失': miss, '类型': q.get('题目类型', '')})
+    return {
+        'total': len(questions),
+        'ok': len(questions) - len(bad),
+        'bad': len(bad),
+        'bad_list': bad,
+    }
+
+
+async def rescrape_questions(page, paper_id, targets, total_count,
+                             log_fn=None, stop_check=None, mode='hybrid') -> dict:
+    """按题号回抓缺失选项/答案的题目。
+
+    通过考试宝的 sequence 参数直接跳转到指定题号重抓，
+    抓到的数据覆盖原有记录（只补缺，不覆盖已完整的字段）。
+    """
+    def log(msg):
+        if log_fn:
+            log_fn(msg)
+        logger.info(msg)
+
+    if not targets:
+        return {'fixed': 0, 'failed': 0, 'details': []}
+
+    fixed, failed, details = 0, 0, []
+    log(f"开始回抓 {len(targets)} 道缺失题目...")
+
+    for n, item in enumerate(targets, 1):
+        if stop_check and stop_check():
+            log("用户请求停止回抓")
+            break
+        seq = item.get('序号')
+        if not isinstance(seq, int):
+            continue
+        try:
+            # sequence 从 0 开始计数，题号 22 -> sequence=21
+            url = (
+                f'https://www.kaoshibao.com/online/?paperId={paper_id}'
+                f'&practice=&modal=1&type=qtype_random&is_recite=&qtype='
+                f'&text=顺序练习&sequence={seq - 1}&is_collect=1&is_vip_paper=0'
+                f'&gid=&is_buy=1&qtype_random_index={seq - 1}'
+            )
+            log(f"[{n}/{len(targets)}] 回抓第 {seq} 题（缺 {','.join(item.get('缺失', []))}）")
+            await navigate_with_retry(page, url)
+            await asyncio.sleep(3)
+            await close_popups(page)
+            await force_show_answer(page)
+
+            loaded = await wait_for_question(page, timeout=12)
+            if not loaded:
+                failed += 1
+                details.append({'序号': seq, 'ok': False, 'reason': '题目未加载'})
+                continue
+
+            data = await get_current_question(page, mode=mode)
+            if not data or not data.get('answer'):
+                await trigger_answer(page, data.get('type', '') if data else '')
+                await asyncio.sleep(1)
+                data = await get_current_question(page, mode=mode)
+
+            # 只补缺失字段，不覆盖已有的
+            orig = item.get('_orig')
+            if orig is not None and data:
+                if not orig.get('正确答案') and data.get('answer'):
+                    orig['正确答案'] = data['answer']
+                if not _normalize_options(orig.get('选项') or []) and data.get('options'):
+                    orig['选项'] = data['options']
+                if data.get('images'):
+                    orig['图片'] = data['images']
+                if data.get('option_images'):
+                    orig['选项图片'] = data['option_images']
+                if not orig.get('解析') and data.get('analysis'):
+                    orig['解析'] = data['analysis']
+
+            ok2, miss2 = check_question_complete(orig if orig is not None else (data or {}))
+            if ok2:
+                fixed += 1
+                details.append({'序号': seq, 'ok': True})
+                log(f"    ✓ 第 {seq} 题已补全")
+            else:
+                failed += 1
+                details.append({'序号': seq, 'ok': False, 'reason': f"仍缺 {','.join(miss2)}"})
+                log(f"    ✗ 第 {seq} 题仍缺 {','.join(miss2)}")
+        except Exception as e:
+            failed += 1
+            details.append({'序号': seq, 'ok': False, 'reason': str(e)[:60]})
+            logger.warning(f"回抓第 {seq} 题失败: {e}")
+
+    log(f"回抓完成：补全 {fixed} 道，失败 {failed} 道")
+    return {'fixed': fixed, 'failed': failed, 'details': details}
 
 
 def save_to_excel(questions: list[dict[str, Any]], filepath: str) -> None:
