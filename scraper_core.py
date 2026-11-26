@@ -625,16 +625,47 @@ async def wait_for_question(page, timeout=10) -> bool:
 
 
 async def get_current_question_dom(page) -> dict | None:
-    """获取当前题目数据（DOM直接读取，速度快但有乱码）"""
+    """获取当前题目数据（DOM直接读取，速度快但有乱码）
+
+    同时收集题干和选项里的 <img> 图片 URL（考试宝题目配图挂在
+    .qusetion-title / .option 内部，src 指向 up.zaixiankaoshi.com）。
+    """
     data = await page.evaluate('''() => {
-        const r = { question: '', options: [], answer: '', analysis: '', type: '' };
+        const r = { question: '', options: [], answer: '', analysis: '', type: '',
+                    images: [], option_images: [] };
+        // 过滤站点图标（icon_vip / nandu_ed / arrow 等），只留真正的题目配图
+        const NOISE = ['icon','logo','nandu','star','arrow','vip','avatar',
+                       'sprite','loading','placeholder','qrcode','erweima',
+                       '/pc/','/common/','/static/'];
+        const okImg = (src, w, h) => {
+            if (!src || src.startsWith('data:')) return false;
+            const low = src.toLowerCase();
+            if (NOISE.some(x => low.includes(x))) return false;
+            if (!(low.includes('up.zaixiankaoshi.com') || low.includes('image') || low.includes('/upload'))) return false;
+            if (w && h && (w < 50 || h < 50)) return false;
+            return true;
+        };
         const typeEl = document.querySelector('.topic-type');
         if (typeEl) r.type = typeEl.innerText.trim();
         const qEl = document.querySelector('.qusetion-title');
-        if (qEl) r.question = qEl.innerText.trim();
-        document.querySelectorAll('.option').forEach(opt => {
+        if (qEl) {
+            r.question = qEl.innerText.trim();
+            qEl.querySelectorAll('img').forEach(im => {
+                const src = im.getAttribute('src') || im.src || '';
+                const w = im.naturalWidth || 0, h = im.naturalHeight || 0;
+                if (okImg(src, w, h)) r.images.push({src: src, w: w, h: h});
+            });
+        }
+        document.querySelectorAll('.option').forEach((opt, idx) => {
             const t = opt.innerText.trim();
             if (t) r.options.push(t);
+            const oimgs = [];
+            opt.querySelectorAll('img').forEach(im => {
+                const src = im.getAttribute('src') || im.src || '';
+                const w = im.naturalWidth || 0, h = im.naturalHeight || 0;
+                if (okImg(src, w, h)) oimgs.push({src: src, w: w, h: h});
+            });
+            if (oimgs.length) r.option_images.push({index: idx, images: oimgs});
         });
         const rights = document.querySelectorAll('.option.right');
         if (rights.length > 0) {
@@ -646,7 +677,16 @@ async def get_current_question_dom(page) -> dict | None:
             r.answer = answers.join(',');
         }
         const analEl = document.querySelector('.answer-box-detail');
-        if (analEl) r.analysis = analEl.innerText.trim();
+        if (analEl) {
+            r.analysis = analEl.innerText.trim();
+            const aimgs = [];
+            analEl.querySelectorAll('img').forEach(im => {
+                const src = im.getAttribute('src') || im.src || '';
+                const w = im.naturalWidth || 0, h = im.naturalHeight || 0;
+                if (okImg(src, w, h)) aimgs.push({src: src, w: w, h: h});
+            });
+            if (aimgs.length) r.analysis_images = aimgs;
+        }
         return r;
     }''')
     return data
@@ -737,6 +777,72 @@ async def _ocr_analysis_section(page) -> str:
     except Exception:
         pass
     return ''
+
+
+def _is_question_image(src: str, w: int = 0, h: int = 0) -> bool:
+    """判断一个 <img> 是不是真正的题目配图。
+
+    排除：站点图标(icon/logo)、难度星级、箭头、VIP 标记、svg-data、
+    以及过小的装饰元素（题目配图一般 ≥ 60px）。
+    """
+    if not src or src.startswith('data:'):
+        return False
+    low = src.lower()
+    noise_words = (
+        'icon', 'logo', 'nandu', 'star', 'arrow', 'vip', 'avatar',
+        'sprite', 'loading', 'placeholder', 'qrcode', 'erweima',
+        '/pc/', '/common/', '/static/',
+    )
+    if any(x in low for x in noise_words):
+        return False
+    # 题目配图域名
+    if 'up.zaixiankaoshi.com' not in low and 'image' not in low and '/upload' not in low:
+        return False
+    # 尺寸过小的一律排除（装饰性）
+    if w and h and (w < 50 or h < 50):
+        return False
+    return True
+
+
+async def _extract_question_images(page) -> dict:
+    """只抓图片 URL，不关心文字。OCR 模式也必须调用，否则配图全丢。
+
+    关键：必须过滤站点图标。考试宝解析区里塞了大量 icon_vip / nandu_ed 之类的
+    装饰图，不过滤会导致每道题都"带 8 张图"。
+    """
+    try:
+        return await page.evaluate('''() => {
+            const out = {images: [], option_images: [], analysis_images: []};
+            const NOISE = ['icon','logo','nandu','star','arrow','vip','avatar',
+                           'sprite','loading','placeholder','qrcode','erweima',
+                           '/pc/','/common/','/static/'];
+            const ok = (src, w, h) => {
+                if (!src || src.startsWith('data:')) return false;
+                const low = src.toLowerCase();
+                if (NOISE.some(x => low.includes(x))) return false;
+                if (!(low.includes('up.zaixiankaoshi.com') || low.includes('image') || low.includes('/upload'))) return false;
+                if (w && h && (w < 50 || h < 50)) return false;
+                return true;
+            };
+            const push = (arr, im) => {
+                const src = im.getAttribute('src') || im.src || '';
+                const w = im.naturalWidth || 0, h = im.naturalHeight || 0;
+                if (ok(src, w, h)) arr.push({src: src, w: w, h: h});
+            };
+            const qEl = document.querySelector('.qusetion-title');
+            if (qEl) qEl.querySelectorAll('img').forEach(im => push(out.images, im));
+            document.querySelectorAll('.option').forEach((opt, idx) => {
+                const buf = [];
+                opt.querySelectorAll('img').forEach(im => push(buf, im));
+                if (buf.length) out.option_images.push({index: idx, images: buf});
+            });
+            const analEl = document.querySelector('.answer-box-detail');
+            if (analEl) analEl.querySelectorAll('img').forEach(im => push(out.analysis_images, im));
+            return out;
+        }''')
+    except Exception as e:
+        logger.warning(f"提取题目图片失败: {e}")
+        return {'images': [], 'option_images': [], 'analysis_images': []}
 
 
 async def get_current_question(page, mode='ocr') -> dict | None:
@@ -917,12 +1023,19 @@ async def get_current_question(page, mode='ocr') -> dict | None:
     # 解析（从分析区域OCR或DOM）
     analysis = await _ocr_analysis_section(page)
 
+    # 题目配图：OCR 只认文字，图片必须单独从 DOM 抓 URL
+    # （考试宝把图挂在 .qusetion-title / .option / .answer-box-detail 的 <img> 里）
+    fig = await _extract_question_images(page)
+
     return {
         'type': qtype,
         'question': question,
         'options': options,
         'answer': answer,
         'analysis': analysis,
+        'images': fig.get('images', []),
+        'option_images': fig.get('option_images', []),
+        'analysis_images': fig.get('analysis_images', []),
     }
 
 
@@ -1407,8 +1520,12 @@ def _add_question_if_new(data: dict[str, Any], questions: list, existing_keys: s
         '题目': data.get('question', ''),
         '选项': data.get('options', []),
         '正确答案': data.get('answer', ''),
-        '解析': data.get('analysis', '')
+        '解析': data.get('analysis', ''),
+        '图片': data.get('images', []),
+        '选项图片': data.get('option_images', []),
     })
+    if data.get('analysis_images'):
+        questions[-1]['解析图片'] = data['analysis_images']
     existing_keys.add(q_key)
     if progress_fn:
         has_ans = sum(1 for q in questions if q.get('正确答案'))
