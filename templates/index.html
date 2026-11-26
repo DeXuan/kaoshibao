@@ -457,6 +457,41 @@
             document.getElementById('paperId').value = id;
         }
 
+        async function auditPaper(pid) {
+            // 1) 先核对
+            let rep;
+            try {
+                let r = await fetch('/api/audit/' + encodeURIComponent(pid));
+                rep = await r.json();
+                if (!r.ok) { showToast(rep.error || '核对失败', 'error'); return; }
+            } catch (e) { showToast('核对请求失败', 'error'); return; }
+
+            if (rep.bad === 0) {
+                showToast('题库 ' + pid + '：' + rep.total + ' 题，选项/答案全部齐全', 'success');
+                return;
+            }
+
+            // 2) 有缺失，确认后回抓
+            let seqs = rep.bad_list.slice(0, 20).map(function(b) { return b['序号']; }).join(', ');
+            let msg = '题库 ' + pid + ' 共 ' + rep.total + ' 题，其中 ' + rep.bad +
+                      ' 题缺选项/答案：\n' + seqs + (rep.bad > 20 ? ' …' : '') +
+                      '\n\n现在回抓这些题目补全吗？';
+            if (!confirm(msg)) return;
+
+            showToast('正在回抓 ' + rep.bad + ' 道题，请稍候…（可能需要几分钟）', 'info');
+            try {
+                let r2 = await fetch('/api/fix/' + encodeURIComponent(pid), { method: 'POST' });
+                let res = await r2.json();
+                if (res.error) { showToast(res.error, 'error'); return; }
+                let a = res.after || {};
+                showToast('补全完成：成功 ' + (res.fixed || 0) + ' 道，失败 ' + (res.failed || 0) +
+                          ' 道。当前完整 ' + (a.ok || 0) + '/' + (a.total || 0), 'success');
+                loadHistory();
+            } catch (e) {
+                showToast('补全请求失败: ' + e.message, 'error');
+            }
+        }
+
         function switchTab(tab) {
             document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); t.setAttribute('aria-selected', 'false'); });
             document.querySelectorAll('.tab-content').forEach(function(t) { t.classList.remove('active'); });
@@ -488,7 +523,9 @@
                         '</div>' +
                         '<div class="file-meta">' +
                             '<button class="btn btn-ghost btn-sm" onclick="setId(\'' + esc(h.paper_id) + '\');switchTab(\'single\');">继续爬</button>' +
+                            '<button class="btn btn-ghost btn-sm" onclick="auditPaper(\'' + esc(h.paper_id) + '\')">核对补全</button>' +
                             '<a class="btn btn-download" href="/api/export/' + encodeURIComponent(h.paper_id) + '?format=xlsx" download>Excel</a>' +
+                            '<a class="btn btn-download" href="/api/export/' + encodeURIComponent(h.paper_id) + '?format=docx" download style="background:#2b579a;">Word</a>' +
                             '<a class="btn btn-download" href="/api/export/' + encodeURIComponent(h.paper_id) + '?format=csv" download style="background:#fa8c16;">CSV</a>' +
                             '<a class="btn btn-download" href="/api/export/' + encodeURIComponent(h.paper_id) + '?format=json" download style="background:#722ed1;">JSON</a>' +
                         '</div>' +
@@ -961,7 +998,8 @@
                 let exportLinks = '';
                 if (pidMatch) {
                     let pid = pidMatch[1];
-                    exportLinks = '<a class="btn btn-download" href="/api/export/' + pid + '?format=csv" download style="background:#fa8c16;">CSV</a>' +
+                    exportLinks = '<a class="btn btn-download" href="/api/export/' + pid + '?format=docx" download style="background:#2b579a;">Word</a>' +
+                                  '<a class="btn btn-download" href="/api/export/' + pid + '?format=csv" download style="background:#fa8c16;">CSV</a>' +
                                   '<a class="btn btn-download" href="/api/export/' + pid + '?format=json" download style="background:#722ed1;">JSON</a>';
                 }
                 let checked = selectedFiles.has(f.name) ? 'checked' : '';
