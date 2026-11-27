@@ -55,29 +55,67 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 DATA_DIR = PROJECT_ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
+# ---- Playwright 临时目录修正 ----
+# Playwright 会在系统 %TEMP% 下 mkdtemp 存放 artifacts，某些 Windows 环境下
+# 那个目录不可写，导致 connect_over_cdp 直接报错：
+#     EPERM: operation not permitted, mkdtemp '...\Temp\playwright-artifacts-XXXXXX'
+# 这里把 TEMP/TMP 指向项目内可写目录，避免依赖系统临时目录权限。
+# 设置 KSB_KEEP_TEMP=1 可跳过（用于排查是否为本项目引起）。
+if os.environ.get('KSB_KEEP_TEMP') != '1':
+    try:
+        _LOCAL_TMP = PROJECT_ROOT / "tmp"
+        _LOCAL_TMP.mkdir(exist_ok=True)
+        # 先验证真的可写，避免把 TEMP 指到一个同样不可写的地方
+        _probe = _LOCAL_TMP / ".write_probe"
+        _probe.write_text("ok", encoding="utf-8")
+        _probe.unlink()
+        os.environ['TEMP'] = str(_LOCAL_TMP)
+        os.environ['TMP'] = str(_LOCAL_TMP)
+    except Exception:
+        pass
+
 CDP_PORT = int(os.environ.get("CDP_PORT", "9223"))
 CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
 
 # 支持的浏览器列表（按优先级排序，根据平台自动选择）
+#
+# ⚠️ 关于 --user-data-dir：本项目一律使用「专用 profile」，绝不碰用户的默认 profile。
+#
+#   原因有两层：
+#
+#   1. 技术上：Chrome 136 起（实测 158 更严格）直接拒绝用默认目录开调试端口，
+#      报错 DevTools remote debugging requires a non-default data directory.
+#      这是 Chrome 防止调试端口窃取 cookie 的加固措施，不是本项目的 bug。
+#
+#   2. 安全上：调试端口一旦接上，等于能以完整登录态操作那个浏览器。
+#      用户的默认 profile 里有 ta 所有网站的 cookie（网银、邮箱、社交……）。
+#      爬个题库不该把这个面暴露出来。用专用 profile 就只暴露考试宝这一个站。
+#
+#   代价：专用 profile 是全新的，需要你在里面登录一次考试宝。
+#   这是一次性成本，之后登录态会保存在这个目录里。
+#
+#   profile 目录固定在项目的 data/chrome-profile（已在 .gitignore 中排除）。
+_CDP_PROFILE_DIR = str(PROJECT_ROOT / "data" / "chrome-profile")
+
 if sys.platform == 'win32':
     _BROWSER_PROFILES = [
         {
             'name': '360浏览器',
             'process': '360ChromeX.exe',
             'exe_path': str(Path.home() / "AppData/Local/360ChromeX/Chrome/Application/360ChromeX.exe"),
-            'user_data': str(Path.home() / "AppData/Local/360ChromeX/Chrome/User Data"),
+            'user_data': _CDP_PROFILE_DIR,
         },
         {
             'name': 'Google Chrome',
             'process': 'chrome.exe',
             'exe_path': r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            'user_data': str(Path.home() / "AppData/Local/Google/Chrome/User Data"),
+            'user_data': _CDP_PROFILE_DIR,
         },
         {
             'name': 'Edge',
             'process': 'msedge.exe',
             'exe_path': r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-            'user_data': str(Path.home() / "AppData/Local/Microsoft/Edge/User Data"),
+            'user_data': _CDP_PROFILE_DIR,
         },
     ]
 else:
@@ -147,60 +185,210 @@ def _detect_any_installed_browser():
     return None
 
 
+def _is_default_user_data(user_data: str) -> bool:
+    """判断某个 user_data 目录是否是浏览器的默认 profile 目录。
+
+    这是安全兜底：带调试端口的浏览器不该使用用户日常 profile，
+    否则调试端口就等于能以完整登录态操作 ta 所有网站的账号。
+    """
+    try:
+        target = Path(user_data).resolve()
+    except Exception:
+        return False
+    home = Path.home()
+    defaults = [
+        home / "AppData/Local/Google/Chrome/User Data",
+        home / "AppData/Local/360ChromeX/Chrome/User Data",
+        home / "AppData/Local/Microsoft/Edge/User Data",
+        home / ".config/google-chrome",
+        home / ".config/chromium",
+    ]
+    for d in defaults:
+        try:
+            if target == d.resolve():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _spawn_detached(exe: str, args: list) -> bool:
+    """启动一个独立进程（不阻塞、不继承句柄）。
+
+    历史包袱说明：曾经以为 Popen 拉不起 Chrome（当时看到 0x80000003 误判成
+    0xC0000003），试过 DETACHED_PROCESS / cmd start / ShellExecuteW /
+    PowerShell .NET Process 等多种绕法。
+
+    真正的原因是 Chrome 沙箱初始化失败，解决办法是启动时带 --no-sandbox
+    （见 _start_browser_with_debug 里的说明）。带上之后，普通 Popen 就够了，
+    不需要那些绕路方案。
+    """
+    kwargs = dict(
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        if sys.platform == 'win32':
+            # 不让子进程继承控制台，避免关掉本服务时把浏览器一起带走
+            kwargs['creationflags'] = 0x00000008  # DETACHED_PROCESS
+        else:
+            kwargs['start_new_session'] = True
+        subprocess.Popen([exe] + args, **kwargs)
+        return True
+    except Exception as e:
+        logger.error(f"启动浏览器失败: {e}")
+        return False
+
+
 def _start_browser_with_debug(browser):
     """以调试模式启动指定浏览器"""
-    cmd = [
-        browser['exe_path'],
+    user_data = browser['user_data']
+    if _is_default_user_data(user_data):
+        logger.error(
+            f"拒绝用浏览器默认 profile 启动调试端口: {user_data}\n"
+            f"调试端口能以完整登录态操作该浏览器，不应指向用户日常 profile。"
+        )
+        return False
+
+    args = [
         f"--remote-debugging-port={CDP_PORT}",
         "--no-first-run",
         "--no-default-browser-check",
-        f"--user-data-dir={browser['user_data']}",
+        f"--user-data-dir={user_data}",
+        # Windows 上必须带 --no-sandbox
+        #
+        # 否则 Chrome 会在沙箱初始化阶段直接退出，退出码 0x80000003
+        # (STATUS_BREAKPOINT)，进程数归零、端口不开，而且 stderr 往往什么都不打。
+        # 打开 Chrome 日志能看到真正的错误：
+        #     ERROR:crashpad_util\file\file_io_win.cc:181]
+        #     CreateFile ...\User Data\Crashpad\settings.dat: 拒绝访问。 (0x5)
+        #
+        # 实测（profile 换空目录也无法避免，说明与 profile 内容无关）：
+        #     空 profile + CDP       -> 0x80000003
+        #     仅 profile，无 CDP     -> 0x80000003
+        #     无任何参数             -> 0x80000003
+        #     加 --no-sandbox        -> 正常启动，端口打开
+        "--no-sandbox",
+        "--disable-gpu",
     ]
     if sys.platform != 'win32':
-        cmd.extend(["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"])
-    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(20):
+        args.append("--disable-dev-shm-usage")
+
+    if not _spawn_detached(browser['exe_path'], args):
+        return False
+
+    for _ in range(25):
         time.sleep(1)
         if is_port_open(CDP_PORT):
             return True
     return False
 
 
+def _chrome_proc_count():
+    """当前 chrome.exe 进程数（Windows）；非 Windows 返回 -1"""
+    if sys.platform != 'win32':
+        return -1
+    try:
+        r = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq chrome.exe", "/NH"],
+            capture_output=True, text=True, timeout=8,
+            encoding='utf-8', errors='ignore',
+        )
+        return r.stdout.lower().count('chrome.exe')
+    except Exception:
+        return -1
+
+
+def _kill_chrome(process_name='chrome.exe'):
+    """结束 Chrome 进程。
+
+    ⚠️ 注意：这个函数不会 100% 成功，因为 Chrome 有进程守护/崩溃恢复机制，
+    主进程被杀后可能被重新拉起。因此不要依赖它来「重启用户的浏览器」。
+
+    ensure_chrome_debug() 已经改成不主动杀用户的浏览器了，
+    这个函数只在用户明确要求重启时使用。
+    """
+    if sys.platform == 'win32':
+        for attempt in range(3):
+            subprocess.run(["taskkill", "/F", "/IM", process_name, "/T"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(1.5)
+            left = _chrome_proc_count()
+            if left <= 0:
+                logger.info(f"Chrome 已退出（第 {attempt + 1} 轮）")
+                return True
+            logger.debug(f"Chrome 仍有 {left} 个进程（第 {attempt + 1} 轮）")
+        return _chrome_proc_count() <= 0
+    else:
+        subprocess.run(["pkill", "-f", process_name],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(2)
+        return True
+
+
 def ensure_chrome_debug():
     """
-    确保Chromium浏览器以调试模式运行。返回 (ok, message, chrome_restarted)
+    确保有可用的调试端口。返回 (ok, message, chrome_restarted)
 
-    自动检测浏览器类型（Chrome/360/Edge），复用已有登录态。
+    设计原则：不去动用户正在使用的浏览器。
+
+    如果 Chrome 已经在运行但没有调试端口，杀掉它再重启是行不通的：
+      - 杀掉用户浏览器 = 丢掉 ta 所有标签页和会话
+      - Chrome 有进程守护，杀了可能被重新拉起，杀不干净
+      - 即使杀干净，重启后调试端口也未必能开（Chrome 136+ 对默认目录的限制）
+
+    所以这里改成：
+      1. 端口已开 -> 直接用
+      2. Chrome 在跑但没端口 -> 不杀，告诉用户怎么办
+      3. Chrome 没在跑 -> 用专用 profile 启动（不碰用户默认 profile）
     """
     if is_port_open(CDP_PORT):
         return True, f"调试端口 {CDP_PORT} 已就绪，复用现有连接", False
 
-    # 检测正在运行的浏览器
+    # 有浏览器在运行，但不带调试端口
     running_browser = _detect_browser()
-
     if running_browser:
-        # 有浏览器在运行但没开调试端口，需要重启
-        if sys.platform == 'win32':
-            subprocess.run(["taskkill", "/F", "/IM", running_browser['process']],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        else:
-            subprocess.run(["pkill", "-f", running_browser['process']],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(2)
-        ok = _start_browser_with_debug(running_browser)
-        if ok:
-            return True, f"{running_browser['name']}已重启（调试模式），登录态已保留", True
-        return False, f"{running_browser['name']}重启失败，请手动关闭后重试", False
+        # 不杀。用专用 profile 另起一个实例（Chrome 支持多实例并行）
+        installed = _detect_any_installed_browser()
+        if installed:
+            logger.info(f"{running_browser['name']} 正在运行但无调试端口，"
+                        f"尝试用专用 profile 另起一个实例（不影响你当前的浏览器）")
+            if _start_browser_with_debug(installed):
+                return (True,
+                        f"已用专用 profile 启动调试实例（profile: {installed['user_data']}）。\n"
+                        f"你原来的浏览器窗口未受影响。\n"
+                        f"如需登录考试宝，请在弹出的新窗口里操作。",
+                        True)
+        return (False,
+                f"{running_browser['name']} 正在运行，但没有调试端口。\n"
+                f"本项目不会关掉你正在用的浏览器。\n\n"
+                f"请选一种方式：\n"
+                f"  1. 手动关闭所有 {running_browser['process']} 窗口，然后重启本项目\n"
+                f"  2. 或先用专用 profile 手动开一个调试实例：\n"
+                f"     \"{running_browser['exe_path']}\" "
+                f"--remote-debugging-port={CDP_PORT} "
+                f"--user-data-dir=\"{running_browser['user_data']}\"\n"
+                f"     然后刷新本页面",
+                False)
 
-    # 没有浏览器在运行，找一个已安装的启动
+    # 没有浏览器在运行，正常启动
     installed = _detect_any_installed_browser()
     if not installed:
         return False, "未找到Chrome/360浏览器/Edge，请先安装其中一个", False
 
     ok = _start_browser_with_debug(installed)
     if ok:
-        return True, f"{installed['name']}已启动，调试端口就绪", True
-    return False, f"{installed['name']}启动超时，请检查安装路径", False
+        return (True,
+                f"{installed['name']}已启动，调试端口就绪\n"
+                f"profile: {installed['user_data']}", True)
+    return (False,
+            f"{installed['name']}启动超时。\n"
+            f"当前 user-data-dir: {installed['user_data']}\n"
+            f"可手动执行：\n"
+            f"  \"{installed['exe_path']}\" --remote-debugging-port={CDP_PORT} "
+            f"--user-data-dir=\"{installed['user_data']}\"",
+            False)
 
 
 async def reopen_kaoshibao(playwright):
