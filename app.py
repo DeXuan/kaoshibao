@@ -899,27 +899,145 @@ def history():
 
 @app.route('/api/export/<paper_id>', methods=['GET'])
 def export_paper(paper_id):
-    """从已保存进度导出为指定格式（csv/json/xlsx）"""
+    """从已保存进度导出为指定格式（csv/json/xlsx/docx）"""
     paper_id, err = validate_paper_id(paper_id)
     if err:
         return jsonify({'error': err}), 400
     fmt = (request.args.get('format') or 'xlsx').lower()
-    if fmt not in ('xlsx', 'csv', 'json'):
-        return jsonify({'error': '不支持的格式，可选 xlsx/csv/json'}), 400
+    if fmt in ('word',):
+        fmt = 'docx'
+    if fmt not in ('xlsx', 'csv', 'json', 'docx'):
+        return jsonify({'error': '不支持的格式，可选 xlsx/csv/json/docx'}), 400
 
+    # 进度文件可能带模式后缀（_hybrid / _dom 等），按优先级查找
     questions = load_progress(paper_id)
+    suffix_used = ''
+    if not questions:
+        for sfx in ('_hybrid', '_dom', '_ocr'):
+            q = load_progress(paper_id, suffix=sfx)
+            if q:
+                questions = q
+                suffix_used = sfx
+                break
     if not questions:
         return jsonify({'error': f'题库 {paper_id} 无进度数据，请先爬取'}), 404
+    logger.info(f"导出来源: progress_{paper_id}{suffix_used}.json（{len(questions)} 题）")
 
     ext = fmt
     filename = f"考试宝题库_{paper_id}.{ext}"
     filepath = OUTPUT_DIR / filename
     try:
-        export_questions(questions, str(filepath), fmt=fmt)
+        if fmt == 'docx':
+            from scraper_core import save_to_docx
+
+            def _log(m):
+                logger.info(m)
+
+            save_to_docx(questions, str(filepath),
+                         title=f"考试宝题库 {paper_id}", log_fn=_log)
+        else:
+            export_questions(questions, str(filepath), fmt=fmt)
     except Exception as e:
         logger.exception(f"导出失败: {e}")
         return jsonify({'error': f'导出失败: {e}'}), 500
     return send_file(filepath, as_attachment=True, download_name=filename)
+
+
+@app.route('/api/audit/<paper_id>', methods=['GET'])
+def audit_paper(paper_id):
+    """核对题库完整性：返回总题数、缺选项/答案的题清单"""
+    paper_id, err = validate_paper_id(paper_id)
+    if err:
+        return jsonify({'error': err}), 400
+
+    questions = load_progress(paper_id)
+    suffix_used = ''
+    if not questions:
+        for sfx in ('_hybrid', '_dom', '_ocr'):
+            q = load_progress(paper_id, suffix=sfx)
+            if q:
+                questions = q
+                suffix_used = sfx
+                break
+    if not questions:
+        return jsonify({'error': f'题库 {paper_id} 无进度数据'}), 404
+
+    from scraper_core import audit_questions
+    report = audit_questions(questions)
+    report['source'] = f'progress_{paper_id}{suffix_used}.json'
+    return jsonify(report)
+
+
+@app.route('/api/fix/<paper_id>', methods=['POST'])
+def fix_paper(paper_id):
+    """核对并回抓缺失选项/答案的题目"""
+    paper_id, err = validate_paper_id(paper_id)
+    if err:
+        return jsonify({'error': err}), 400
+
+    suffix_used = ''
+    questions = load_progress(paper_id)
+    if not questions:
+        for sfx in ('_hybrid', '_dom', '_ocr'):
+            q = load_progress(paper_id, suffix=sfx)
+            if q:
+                questions = q
+                suffix_used = sfx
+                break
+    if not questions:
+        return jsonify({'error': f'题库 {paper_id} 无进度数据'}), 404
+
+    if not get_chrome_status():
+        return jsonify({'error': 'Chrome 未连接，请先启动 Chrome'}), 400
+
+    from scraper_core import audit_questions, rescrape_questions, open_cdp_page, save_progress
+
+    report = audit_questions(questions)
+    if report['bad'] == 0:
+        return jsonify({'ok': True, 'message': '全部题目选项/答案齐全，无需补全',
+                        'total': report['total'], 'fixed': 0})
+
+    async def _run():
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser, page = await open_cdp_page(p)
+            if not page:
+                return {'ok': False, 'error': '无法连接 Chrome'}
+            try:
+                targets = []
+                for item in report['bad_list']:
+                    orig = next((x for x in questions if x.get('序号') == item['序号']), None)
+                    if orig is not None:
+                        targets.append({'序号': item['序号'], '缺失': item['缺失'], '_orig': orig})
+                res = await rescrape_questions(page, paper_id, targets, len(questions),
+                                               mode='hybrid')
+                save_progress(paper_id, questions,
+                              suffix=suffix_used)
+                after = audit_questions(questions)
+                res['after'] = {'total': after['total'], 'ok': after['ok'], 'bad': after['bad']}
+                res['ok'] = True
+                return res
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    try:
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(_run())
+        finally:
+            loop.close()
+        result['before'] = {'total': report['total'], 'bad': report['bad']}
+        return jsonify(result)
+    except Exception as e:
+        logger.exception(f"补全失败: {e}")
+        return jsonify({'error': f'补全失败: {e}'}), 500
 
 
 def _build_openapi_spec() -> dict:

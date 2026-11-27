@@ -67,3 +67,15 @@ debug/diag_*.py
 debug/*.log
 debug/*.json
 debug/wmi_test*
+
+# 环境变量（含密钥，绝不提交）
+.env
+
+# 本地运行时临时目录（Playwright artifact / pip 临时文件）
+tmp/
+
+# pip 残留
+pip-install-*/
+pip-build-tracker-*/
+pip-ephem-wheel-cache-*/
+pip-unpack-*/

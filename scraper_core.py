@@ -55,29 +55,67 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 DATA_DIR = PROJECT_ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
+# ---- Playwright 临时目录修正 ----
+# Playwright 会在系统 %TEMP% 下 mkdtemp 存放 artifacts，某些 Windows 环境下
+# 那个目录不可写，导致 connect_over_cdp 直接报错：
+#     EPERM: operation not permitted, mkdtemp '...\Temp\playwright-artifacts-XXXXXX'
+# 这里把 TEMP/TMP 指向项目内可写目录，避免依赖系统临时目录权限。
+# 设置 KSB_KEEP_TEMP=1 可跳过（用于排查是否为本项目引起）。
+if os.environ.get('KSB_KEEP_TEMP') != '1':
+    try:
+        _LOCAL_TMP = PROJECT_ROOT / "tmp"
+        _LOCAL_TMP.mkdir(exist_ok=True)
+        # 先验证真的可写，避免把 TEMP 指到一个同样不可写的地方
+        _probe = _LOCAL_TMP / ".write_probe"
+        _probe.write_text("ok", encoding="utf-8")
+        _probe.unlink()
+        os.environ['TEMP'] = str(_LOCAL_TMP)
+        os.environ['TMP'] = str(_LOCAL_TMP)
+    except Exception:
+        pass
+
 CDP_PORT = int(os.environ.get("CDP_PORT", "9223"))
 CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
 
 # 支持的浏览器列表（按优先级排序，根据平台自动选择）
+#
+# ⚠️ 关于 --user-data-dir：本项目一律使用「专用 profile」，绝不碰用户的默认 profile。
+#
+#   原因有两层：
+#
+#   1. 技术上：Chrome 136 起（实测 158 更严格）直接拒绝用默认目录开调试端口，
+#      报错 DevTools remote debugging requires a non-default data directory.
+#      这是 Chrome 防止调试端口窃取 cookie 的加固措施，不是本项目的 bug。
+#
+#   2. 安全上：调试端口一旦接上，等于能以完整登录态操作那个浏览器。
+#      用户的默认 profile 里有 ta 所有网站的 cookie（网银、邮箱、社交……）。
+#      爬个题库不该把这个面暴露出来。用专用 profile 就只暴露考试宝这一个站。
+#
+#   代价：专用 profile 是全新的，需要你在里面登录一次考试宝。
+#   这是一次性成本，之后登录态会保存在这个目录里。
+#
+#   profile 目录固定在项目的 data/chrome-profile（已在 .gitignore 中排除）。
+_CDP_PROFILE_DIR = str(PROJECT_ROOT / "data" / "chrome-profile")
+
 if sys.platform == 'win32':
     _BROWSER_PROFILES = [
         {
             'name': '360浏览器',
             'process': '360ChromeX.exe',
             'exe_path': str(Path.home() / "AppData/Local/360ChromeX/Chrome/Application/360ChromeX.exe"),
-            'user_data': str(Path.home() / "AppData/Local/360ChromeX/Chrome/User Data"),
+            'user_data': _CDP_PROFILE_DIR,
         },
         {
             'name': 'Google Chrome',
             'process': 'chrome.exe',
             'exe_path': r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            'user_data': str(Path.home() / "AppData/Local/Google/Chrome/User Data"),
+            'user_data': _CDP_PROFILE_DIR,
         },
         {
             'name': 'Edge',
             'process': 'msedge.exe',
             'exe_path': r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-            'user_data': str(Path.home() / "AppData/Local/Microsoft/Edge/User Data"),
+            'user_data': _CDP_PROFILE_DIR,
         },
     ]
 else:
@@ -147,60 +185,210 @@ def _detect_any_installed_browser():
     return None
 
 
+def _is_default_user_data(user_data: str) -> bool:
+    """判断某个 user_data 目录是否是浏览器的默认 profile 目录。
+
+    这是安全兜底：带调试端口的浏览器不该使用用户日常 profile，
+    否则调试端口就等于能以完整登录态操作 ta 所有网站的账号。
+    """
+    try:
+        target = Path(user_data).resolve()
+    except Exception:
+        return False
+    home = Path.home()
+    defaults = [
+        home / "AppData/Local/Google/Chrome/User Data",
+        home / "AppData/Local/360ChromeX/Chrome/User Data",
+        home / "AppData/Local/Microsoft/Edge/User Data",
+        home / ".config/google-chrome",
+        home / ".config/chromium",
+    ]
+    for d in defaults:
+        try:
+            if target == d.resolve():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _spawn_detached(exe: str, args: list) -> bool:
+    """启动一个独立进程（不阻塞、不继承句柄）。
+
+    历史包袱说明：曾经以为 Popen 拉不起 Chrome（当时看到 0x80000003 误判成
+    0xC0000003），试过 DETACHED_PROCESS / cmd start / ShellExecuteW /
+    PowerShell .NET Process 等多种绕法。
+
+    真正的原因是 Chrome 沙箱初始化失败，解决办法是启动时带 --no-sandbox
+    （见 _start_browser_with_debug 里的说明）。带上之后，普通 Popen 就够了，
+    不需要那些绕路方案。
+    """
+    kwargs = dict(
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        if sys.platform == 'win32':
+            # 不让子进程继承控制台，避免关掉本服务时把浏览器一起带走
+            kwargs['creationflags'] = 0x00000008  # DETACHED_PROCESS
+        else:
+            kwargs['start_new_session'] = True
+        subprocess.Popen([exe] + args, **kwargs)
+        return True
+    except Exception as e:
+        logger.error(f"启动浏览器失败: {e}")
+        return False
+
+
 def _start_browser_with_debug(browser):
     """以调试模式启动指定浏览器"""
-    cmd = [
-        browser['exe_path'],
+    user_data = browser['user_data']
+    if _is_default_user_data(user_data):
+        logger.error(
+            f"拒绝用浏览器默认 profile 启动调试端口: {user_data}\n"
+            f"调试端口能以完整登录态操作该浏览器，不应指向用户日常 profile。"
+        )
+        return False
+
+    args = [
         f"--remote-debugging-port={CDP_PORT}",
         "--no-first-run",
         "--no-default-browser-check",
-        f"--user-data-dir={browser['user_data']}",
+        f"--user-data-dir={user_data}",
+        # Windows 上必须带 --no-sandbox
+        #
+        # 否则 Chrome 会在沙箱初始化阶段直接退出，退出码 0x80000003
+        # (STATUS_BREAKPOINT)，进程数归零、端口不开，而且 stderr 往往什么都不打。
+        # 打开 Chrome 日志能看到真正的错误：
+        #     ERROR:crashpad_util\file\file_io_win.cc:181]
+        #     CreateFile ...\User Data\Crashpad\settings.dat: 拒绝访问。 (0x5)
+        #
+        # 实测（profile 换空目录也无法避免，说明与 profile 内容无关）：
+        #     空 profile + CDP       -> 0x80000003
+        #     仅 profile，无 CDP     -> 0x80000003
+        #     无任何参数             -> 0x80000003
+        #     加 --no-sandbox        -> 正常启动，端口打开
+        "--no-sandbox",
+        "--disable-gpu",
     ]
     if sys.platform != 'win32':
-        cmd.extend(["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"])
-    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(20):
+        args.append("--disable-dev-shm-usage")
+
+    if not _spawn_detached(browser['exe_path'], args):
+        return False
+
+    for _ in range(25):
         time.sleep(1)
         if is_port_open(CDP_PORT):
             return True
     return False
 
 
+def _chrome_proc_count():
+    """当前 chrome.exe 进程数（Windows）；非 Windows 返回 -1"""
+    if sys.platform != 'win32':
+        return -1
+    try:
+        r = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq chrome.exe", "/NH"],
+            capture_output=True, text=True, timeout=8,
+            encoding='utf-8', errors='ignore',
+        )
+        return r.stdout.lower().count('chrome.exe')
+    except Exception:
+        return -1
+
+
+def _kill_chrome(process_name='chrome.exe'):
+    """结束 Chrome 进程。
+
+    ⚠️ 注意：这个函数不会 100% 成功，因为 Chrome 有进程守护/崩溃恢复机制，
+    主进程被杀后可能被重新拉起。因此不要依赖它来「重启用户的浏览器」。
+
+    ensure_chrome_debug() 已经改成不主动杀用户的浏览器了，
+    这个函数只在用户明确要求重启时使用。
+    """
+    if sys.platform == 'win32':
+        for attempt in range(3):
+            subprocess.run(["taskkill", "/F", "/IM", process_name, "/T"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(1.5)
+            left = _chrome_proc_count()
+            if left <= 0:
+                logger.info(f"Chrome 已退出（第 {attempt + 1} 轮）")
+                return True
+            logger.debug(f"Chrome 仍有 {left} 个进程（第 {attempt + 1} 轮）")
+        return _chrome_proc_count() <= 0
+    else:
+        subprocess.run(["pkill", "-f", process_name],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(2)
+        return True
+
+
 def ensure_chrome_debug():
     """
-    确保Chromium浏览器以调试模式运行。返回 (ok, message, chrome_restarted)
+    确保有可用的调试端口。返回 (ok, message, chrome_restarted)
 
-    自动检测浏览器类型（Chrome/360/Edge），复用已有登录态。
+    设计原则：不去动用户正在使用的浏览器。
+
+    如果 Chrome 已经在运行但没有调试端口，杀掉它再重启是行不通的：
+      - 杀掉用户浏览器 = 丢掉 ta 所有标签页和会话
+      - Chrome 有进程守护，杀了可能被重新拉起，杀不干净
+      - 即使杀干净，重启后调试端口也未必能开（Chrome 136+ 对默认目录的限制）
+
+    所以这里改成：
+      1. 端口已开 -> 直接用
+      2. Chrome 在跑但没端口 -> 不杀，告诉用户怎么办
+      3. Chrome 没在跑 -> 用专用 profile 启动（不碰用户默认 profile）
     """
     if is_port_open(CDP_PORT):
         return True, f"调试端口 {CDP_PORT} 已就绪，复用现有连接", False
 
-    # 检测正在运行的浏览器
+    # 有浏览器在运行，但不带调试端口
     running_browser = _detect_browser()
-
     if running_browser:
-        # 有浏览器在运行但没开调试端口，需要重启
-        if sys.platform == 'win32':
-            subprocess.run(["taskkill", "/F", "/IM", running_browser['process']],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        else:
-            subprocess.run(["pkill", "-f", running_browser['process']],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(2)
-        ok = _start_browser_with_debug(running_browser)
-        if ok:
-            return True, f"{running_browser['name']}已重启（调试模式），登录态已保留", True
-        return False, f"{running_browser['name']}重启失败，请手动关闭后重试", False
+        # 不杀。用专用 profile 另起一个实例（Chrome 支持多实例并行）
+        installed = _detect_any_installed_browser()
+        if installed:
+            logger.info(f"{running_browser['name']} 正在运行但无调试端口，"
+                        f"尝试用专用 profile 另起一个实例（不影响你当前的浏览器）")
+            if _start_browser_with_debug(installed):
+                return (True,
+                        f"已用专用 profile 启动调试实例（profile: {installed['user_data']}）。\n"
+                        f"你原来的浏览器窗口未受影响。\n"
+                        f"如需登录考试宝，请在弹出的新窗口里操作。",
+                        True)
+        return (False,
+                f"{running_browser['name']} 正在运行，但没有调试端口。\n"
+                f"本项目不会关掉你正在用的浏览器。\n\n"
+                f"请选一种方式：\n"
+                f"  1. 手动关闭所有 {running_browser['process']} 窗口，然后重启本项目\n"
+                f"  2. 或先用专用 profile 手动开一个调试实例：\n"
+                f"     \"{running_browser['exe_path']}\" "
+                f"--remote-debugging-port={CDP_PORT} "
+                f"--user-data-dir=\"{running_browser['user_data']}\"\n"
+                f"     然后刷新本页面",
+                False)
 
-    # 没有浏览器在运行，找一个已安装的启动
+    # 没有浏览器在运行，正常启动
     installed = _detect_any_installed_browser()
     if not installed:
         return False, "未找到Chrome/360浏览器/Edge，请先安装其中一个", False
 
     ok = _start_browser_with_debug(installed)
     if ok:
-        return True, f"{installed['name']}已启动，调试端口就绪", True
-    return False, f"{installed['name']}启动超时，请检查安装路径", False
+        return (True,
+                f"{installed['name']}已启动，调试端口就绪\n"
+                f"profile: {installed['user_data']}", True)
+    return (False,
+            f"{installed['name']}启动超时。\n"
+            f"当前 user-data-dir: {installed['user_data']}\n"
+            f"可手动执行：\n"
+            f"  \"{installed['exe_path']}\" --remote-debugging-port={CDP_PORT} "
+            f"--user-data-dir=\"{installed['user_data']}\"",
+            False)
 
 
 async def reopen_kaoshibao(playwright):
@@ -418,6 +606,53 @@ async def enable_recite_mode(page) -> bool:
     return enabled
 
 
+async def force_show_answer(page) -> bool:
+    """强制显示正确答案。
+
+    回抓缺失答案时用：先确保背题模式开着（背题模式会直接给答案），
+    再兜底点击"查看答案/查看解析"。
+    """
+    # 1) 已有答案就别折腾
+    try:
+        has = await page.evaluate('''() => {
+            if (document.querySelector('.option.right')) return true;
+            const t = document.body.innerText || '';
+            return t.includes('正确答案');
+        }''')
+        if has:
+            return True
+    except Exception:
+        pass
+
+    # 2) 开背题模式
+    try:
+        await enable_recite_mode(page)
+        await asyncio.sleep(1)
+    except Exception:
+        pass
+
+    # 3) 兜底点击查看答案按钮
+    try:
+        clicked = await page.evaluate('''() => {
+            const words = ['查看答案', '查看解析', '显示答案', '确定', '提交'];
+            const els = document.querySelectorAll('button, .btn, a, [role="button"], span, div');
+            for (const el of els) {
+                const txt = (el.innerText || '').trim();
+                if (txt && txt.length <= 6 && words.includes(txt) && el.offsetParent !== null) {
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        }''')
+        if clicked:
+            await asyncio.sleep(1.5)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 async def wait_for_question(page, timeout=10) -> bool:
     """等待题目元素出现（包含modal中的题目）"""
     selectors = [
@@ -437,16 +672,47 @@ async def wait_for_question(page, timeout=10) -> bool:
 
 
 async def get_current_question_dom(page) -> dict | None:
-    """获取当前题目数据（DOM直接读取，速度快但有乱码）"""
+    """获取当前题目数据（DOM直接读取，速度快但有乱码）
+
+    同时收集题干和选项里的 <img> 图片 URL（考试宝题目配图挂在
+    .qusetion-title / .option 内部，src 指向 up.zaixiankaoshi.com）。
+    """
     data = await page.evaluate('''() => {
-        const r = { question: '', options: [], answer: '', analysis: '', type: '' };
+        const r = { question: '', options: [], answer: '', analysis: '', type: '',
+                    images: [], option_images: [] };
+        // 过滤站点图标（icon_vip / nandu_ed / arrow 等），只留真正的题目配图
+        const NOISE = ['icon','logo','nandu','star','arrow','vip','avatar',
+                       'sprite','loading','placeholder','qrcode','erweima',
+                       '/pc/','/common/','/static/'];
+        const okImg = (src, w, h) => {
+            if (!src || src.startsWith('data:')) return false;
+            const low = src.toLowerCase();
+            if (NOISE.some(x => low.includes(x))) return false;
+            if (!(low.includes('up.zaixiankaoshi.com') || low.includes('image') || low.includes('/upload'))) return false;
+            if (w && h && (w < 50 || h < 50)) return false;
+            return true;
+        };
         const typeEl = document.querySelector('.topic-type');
         if (typeEl) r.type = typeEl.innerText.trim();
         const qEl = document.querySelector('.qusetion-title');
-        if (qEl) r.question = qEl.innerText.trim();
-        document.querySelectorAll('.option').forEach(opt => {
+        if (qEl) {
+            r.question = qEl.innerText.trim();
+            qEl.querySelectorAll('img').forEach(im => {
+                const src = im.getAttribute('src') || im.src || '';
+                const w = im.naturalWidth || 0, h = im.naturalHeight || 0;
+                if (okImg(src, w, h)) r.images.push({src: src, w: w, h: h});
+            });
+        }
+        document.querySelectorAll('.option').forEach((opt, idx) => {
             const t = opt.innerText.trim();
             if (t) r.options.push(t);
+            const oimgs = [];
+            opt.querySelectorAll('img').forEach(im => {
+                const src = im.getAttribute('src') || im.src || '';
+                const w = im.naturalWidth || 0, h = im.naturalHeight || 0;
+                if (okImg(src, w, h)) oimgs.push({src: src, w: w, h: h});
+            });
+            if (oimgs.length) r.option_images.push({index: idx, images: oimgs});
         });
         const rights = document.querySelectorAll('.option.right');
         if (rights.length > 0) {
@@ -458,7 +724,16 @@ async def get_current_question_dom(page) -> dict | None:
             r.answer = answers.join(',');
         }
         const analEl = document.querySelector('.answer-box-detail');
-        if (analEl) r.analysis = analEl.innerText.trim();
+        if (analEl) {
+            r.analysis = analEl.innerText.trim();
+            const aimgs = [];
+            analEl.querySelectorAll('img').forEach(im => {
+                const src = im.getAttribute('src') || im.src || '';
+                const w = im.naturalWidth || 0, h = im.naturalHeight || 0;
+                if (okImg(src, w, h)) aimgs.push({src: src, w: w, h: h});
+            });
+            if (aimgs.length) r.analysis_images = aimgs;
+        }
         return r;
     }''')
     return data
@@ -549,6 +824,72 @@ async def _ocr_analysis_section(page) -> str:
     except Exception:
         pass
     return ''
+
+
+def _is_question_image(src: str, w: int = 0, h: int = 0) -> bool:
+    """判断一个 <img> 是不是真正的题目配图。
+
+    排除：站点图标(icon/logo)、难度星级、箭头、VIP 标记、svg-data、
+    以及过小的装饰元素（题目配图一般 ≥ 60px）。
+    """
+    if not src or src.startswith('data:'):
+        return False
+    low = src.lower()
+    noise_words = (
+        'icon', 'logo', 'nandu', 'star', 'arrow', 'vip', 'avatar',
+        'sprite', 'loading', 'placeholder', 'qrcode', 'erweima',
+        '/pc/', '/common/', '/static/',
+    )
+    if any(x in low for x in noise_words):
+        return False
+    # 题目配图域名
+    if 'up.zaixiankaoshi.com' not in low and 'image' not in low and '/upload' not in low:
+        return False
+    # 尺寸过小的一律排除（装饰性）
+    if w and h and (w < 50 or h < 50):
+        return False
+    return True
+
+
+async def _extract_question_images(page) -> dict:
+    """只抓图片 URL，不关心文字。OCR 模式也必须调用，否则配图全丢。
+
+    关键：必须过滤站点图标。考试宝解析区里塞了大量 icon_vip / nandu_ed 之类的
+    装饰图，不过滤会导致每道题都"带 8 张图"。
+    """
+    try:
+        return await page.evaluate('''() => {
+            const out = {images: [], option_images: [], analysis_images: []};
+            const NOISE = ['icon','logo','nandu','star','arrow','vip','avatar',
+                           'sprite','loading','placeholder','qrcode','erweima',
+                           '/pc/','/common/','/static/'];
+            const ok = (src, w, h) => {
+                if (!src || src.startsWith('data:')) return false;
+                const low = src.toLowerCase();
+                if (NOISE.some(x => low.includes(x))) return false;
+                if (!(low.includes('up.zaixiankaoshi.com') || low.includes('image') || low.includes('/upload'))) return false;
+                if (w && h && (w < 50 || h < 50)) return false;
+                return true;
+            };
+            const push = (arr, im) => {
+                const src = im.getAttribute('src') || im.src || '';
+                const w = im.naturalWidth || 0, h = im.naturalHeight || 0;
+                if (ok(src, w, h)) arr.push({src: src, w: w, h: h});
+            };
+            const qEl = document.querySelector('.qusetion-title');
+            if (qEl) qEl.querySelectorAll('img').forEach(im => push(out.images, im));
+            document.querySelectorAll('.option').forEach((opt, idx) => {
+                const buf = [];
+                opt.querySelectorAll('img').forEach(im => push(buf, im));
+                if (buf.length) out.option_images.push({index: idx, images: buf});
+            });
+            const analEl = document.querySelector('.answer-box-detail');
+            if (analEl) analEl.querySelectorAll('img').forEach(im => push(out.analysis_images, im));
+            return out;
+        }''')
+    except Exception as e:
+        logger.warning(f"提取题目图片失败: {e}")
+        return {'images': [], 'option_images': [], 'analysis_images': []}
 
 
 async def get_current_question(page, mode='ocr') -> dict | None:
@@ -729,12 +1070,19 @@ async def get_current_question(page, mode='ocr') -> dict | None:
     # 解析（从分析区域OCR或DOM）
     analysis = await _ocr_analysis_section(page)
 
+    # 题目配图：OCR 只认文字，图片必须单独从 DOM 抓 URL
+    # （考试宝把图挂在 .qusetion-title / .option / .answer-box-detail 的 <img> 里）
+    fig = await _extract_question_images(page)
+
     return {
         'type': qtype,
         'question': question,
         'options': options,
         'answer': answer,
         'analysis': analysis,
+        'images': fig.get('images', []),
+        'option_images': fig.get('option_images', []),
+        'analysis_images': fig.get('analysis_images', []),
     }
 
 
@@ -1219,8 +1567,12 @@ def _add_question_if_new(data: dict[str, Any], questions: list, existing_keys: s
         '题目': data.get('question', ''),
         '选项': data.get('options', []),
         '正确答案': data.get('answer', ''),
-        '解析': data.get('analysis', '')
+        '解析': data.get('analysis', ''),
+        '图片': data.get('images', []),
+        '选项图片': data.get('option_images', []),
     })
+    if data.get('analysis_images'):
+        questions[-1]['解析图片'] = data['analysis_images']
     existing_keys.add(q_key)
     if progress_fn:
         has_ans = sum(1 for q in questions if q.get('正确答案'))
@@ -1263,7 +1615,8 @@ async def _recover_page(page, paper_id, questions: list, log_fn=None) -> bool:
 
 async def collect_questions(page, paper_id, log_fn=None, stop_check=None, progress_fn=None,
                            start_sequence=0, max_questions=0, mode='ocr',
-                           existing_questions=None, repeat_limit=10) -> tuple[list[dict[str, Any]], str]:
+                           existing_questions=None, repeat_limit=10,
+                           audit_fix=True) -> tuple[list[dict[str, Any]], str]:
     """
     背题模式下收集所有题目+答案+解析
 
@@ -1276,6 +1629,7 @@ async def collect_questions(page, paper_id, log_fn=None, stop_check=None, progre
         start_sequence: 起始题目序号（用于分段并行）
         max_questions: 最多收集题目数（0=不限）
         existing_questions: 已有进度（用于去重，仅新增缺失题）
+        audit_fix: 收集结束后核对每题选项/答案，缺的回抓补全
     """
     questions = []
     existing_keys = set()
@@ -1421,6 +1775,36 @@ async def collect_questions(page, paper_id, log_fn=None, stop_check=None, progre
         has_ans = sum(1 for q in questions if q.get('正确答案'))
         log(f"完成: {len(questions)} 题, 有答案 {has_ans} 题")
 
+        # ===== 完整性核对 + 自动回抓缺失项 =====
+        if audit_fix and questions:
+            report = audit_questions(questions)
+            if report['bad'] > 0:
+                log(f"核对发现 {report['bad']} 道题缺选项/答案，开始回抓...")
+                targets = []
+                for item in report['bad_list']:
+                    seq = item['序号']
+                    orig = next((x for x in questions if x.get('序号') == seq), None)
+                    if orig is not None:
+                        targets.append({'序号': seq, '缺失': item['缺失'], '_orig': orig})
+                res = await rescrape_questions(
+                    page, paper_id, targets, len(questions),
+                    log_fn=log_fn, stop_check=stop_check, mode=mode,
+                )
+                # 回抓后再次核对
+                report2 = audit_questions(questions)
+                log(f"回抓后核对：完整 {report2['ok']}/{report2['total']}，"
+                    f"仍缺 {report2['bad']} 道")
+                try:
+                    save_progress(paper_id, questions,
+                                  suffix=f'_{mode}' if mode and mode != 'ocr' else '')
+                except Exception:
+                    pass
+                if report2['bad'] > 0:
+                    log("仍有题目缺项，可稍后用「核对补全」按钮重试："
+                        + ', '.join(str(b['序号']) for b in report2['bad_list'][:20]))
+            else:
+                log(f"核对通过：{report['total']} 道题选项/答案齐全")
+
         # 分段模式：未达上限且非正常结束（翻题失败/恢复失败等），标记 error 触发重试
         if max_questions > 0 and not normal_end and len(questions) < max_questions:
             log(f"分段未达上限: 已收集 {len(questions)}/{max_questions} 题，标记为需重试")
@@ -1432,6 +1816,135 @@ async def collect_questions(page, paper_id, log_fn=None, stop_check=None, progre
         return questions, 'error'
 
     return questions, 'ok'
+
+
+def check_question_complete(q: dict) -> tuple[bool, list[str]]:
+    """核对单题是否完整：选项 + 答案。
+
+    返回 (是否完整, 缺失项列表)。
+    - 单选题/多选题：必须有 正确答案，且选项 >= 2 个（或选项图）
+    - 判断题：有答案即可
+    - 填空题/简答：只要题干和答案
+    """
+    missing = []
+    qtype = (q.get('题目类型') or '')
+    question = (q.get('题目') or '').strip()
+    opts = _normalize_options(q.get('选项') or [])
+    ans = (q.get('正确答案') or '').strip()
+
+    if not question:
+        missing.append('题干')
+
+    if not ans:
+        missing.append('答案')
+
+    # 需要选项的题型
+    need_opt = any(k in qtype for k in ('单选', '多选', '不定项', '选择'))
+    if need_opt:
+        has_opt_img = bool(q.get('选项图片'))
+        if len(opts) < 2 and not has_opt_img:
+            missing.append('选项')
+
+    return (len(missing) == 0, missing)
+
+
+def audit_questions(questions: list[dict]) -> dict:
+    """全量核对，返回缺失统计与待重抓清单。"""
+    bad = []
+    for q in questions:
+        ok, miss = check_question_complete(q)
+        if not ok:
+            bad.append({'序号': q.get('序号'), '题目': (q.get('题目') or '')[:60],
+                        '缺失': miss, '类型': q.get('题目类型', '')})
+    return {
+        'total': len(questions),
+        'ok': len(questions) - len(bad),
+        'bad': len(bad),
+        'bad_list': bad,
+    }
+
+
+async def rescrape_questions(page, paper_id, targets, total_count,
+                             log_fn=None, stop_check=None, mode='hybrid') -> dict:
+    """按题号回抓缺失选项/答案的题目。
+
+    通过考试宝的 sequence 参数直接跳转到指定题号重抓，
+    抓到的数据覆盖原有记录（只补缺，不覆盖已完整的字段）。
+    """
+    def log(msg):
+        if log_fn:
+            log_fn(msg)
+        logger.info(msg)
+
+    if not targets:
+        return {'fixed': 0, 'failed': 0, 'details': []}
+
+    fixed, failed, details = 0, 0, []
+    log(f"开始回抓 {len(targets)} 道缺失题目...")
+
+    for n, item in enumerate(targets, 1):
+        if stop_check and stop_check():
+            log("用户请求停止回抓")
+            break
+        seq = item.get('序号')
+        if not isinstance(seq, int):
+            continue
+        try:
+            # sequence 从 0 开始计数，题号 22 -> sequence=21
+            url = (
+                f'https://www.kaoshibao.com/online/?paperId={paper_id}'
+                f'&practice=&modal=1&type=qtype_random&is_recite=&qtype='
+                f'&text=顺序练习&sequence={seq - 1}&is_collect=1&is_vip_paper=0'
+                f'&gid=&is_buy=1&qtype_random_index={seq - 1}'
+            )
+            log(f"[{n}/{len(targets)}] 回抓第 {seq} 题（缺 {','.join(item.get('缺失', []))}）")
+            await navigate_with_retry(page, url)
+            await asyncio.sleep(3)
+            await close_popups(page)
+            await force_show_answer(page)
+
+            loaded = await wait_for_question(page, timeout=12)
+            if not loaded:
+                failed += 1
+                details.append({'序号': seq, 'ok': False, 'reason': '题目未加载'})
+                continue
+
+            data = await get_current_question(page, mode=mode)
+            if not data or not data.get('answer'):
+                await trigger_answer(page, data.get('type', '') if data else '')
+                await asyncio.sleep(1)
+                data = await get_current_question(page, mode=mode)
+
+            # 只补缺失字段，不覆盖已有的
+            orig = item.get('_orig')
+            if orig is not None and data:
+                if not orig.get('正确答案') and data.get('answer'):
+                    orig['正确答案'] = data['answer']
+                if not _normalize_options(orig.get('选项') or []) and data.get('options'):
+                    orig['选项'] = data['options']
+                if data.get('images'):
+                    orig['图片'] = data['images']
+                if data.get('option_images'):
+                    orig['选项图片'] = data['option_images']
+                if not orig.get('解析') and data.get('analysis'):
+                    orig['解析'] = data['analysis']
+
+            ok2, miss2 = check_question_complete(orig if orig is not None else (data or {}))
+            if ok2:
+                fixed += 1
+                details.append({'序号': seq, 'ok': True})
+                log(f"    ✓ 第 {seq} 题已补全")
+            else:
+                failed += 1
+                details.append({'序号': seq, 'ok': False, 'reason': f"仍缺 {','.join(miss2)}"})
+                log(f"    ✗ 第 {seq} 题仍缺 {','.join(miss2)}")
+        except Exception as e:
+            failed += 1
+            details.append({'序号': seq, 'ok': False, 'reason': str(e)[:60]})
+            logger.warning(f"回抓第 {seq} 题失败: {e}")
+
+    log(f"回抓完成：补全 {fixed} 道，失败 {failed} 道")
+    return {'fixed': fixed, 'failed': failed, 'details': details}
 
 
 def save_to_excel(questions: list[dict[str, Any]], filepath: str) -> None:
@@ -1478,17 +1991,39 @@ def save_to_excel(questions: list[dict[str, Any]], filepath: str) -> None:
 
 
 def _normalize_options(opts) -> list[str]:
-    """统一选项为列表形式"""
+    """统一选项为列表形式，并去掉重复的选项字母前缀。
+
+    DOM 抓到的选项常是 "A\\nA\\n使挡板开度与输入信号成比例"（字母被渲染两次），
+    也可能是 "A\\n内容" 或 "A. 内容"。这里统一剥掉开头的字母行/字母前缀。
+
+    特殊情况：选项纯图片时 DOM 里只有 "A\\nA"，剥完会变空。
+    这种题不能当成"没有选项"，否则核对会误判。保留一个占位标记。
+    """
     if isinstance(opts, str):
         opts = [o.strip() for o in opts.split('\n') if o.strip()]
     cleaned_list = []
-    for opt in (opts or []):
-        cleaned = opt
-        if len(cleaned) > 2 and cleaned[0] in 'ABCDEF' and cleaned[1] in '.、 ':
-            cleaned = cleaned[2:].strip()
-        elif len(cleaned) > 3 and cleaned[0] in 'ABCDEF' and cleaned[1:3] in ['. ', '、 ']:
-            cleaned = cleaned[3:].strip()
-        cleaned_list.append(cleaned)
+    for idx, opt in enumerate(opts or []):
+        s = (opt or '').strip()
+        if not s:
+            continue
+        raw = s
+        # 逐行剥掉开头的纯字母行（A / B / C ...）
+        lines = s.split('\n')
+        while lines and len(lines[0].strip()) <= 2 and lines[0].strip()[:1] in 'ABCDEF' and lines[0].strip()[1:].strip() in ('', '.', '、', '．'):
+            lines.pop(0)
+        s = '\n'.join(lines).strip()
+        # 再剥一次行内前缀 "A. " / "A、"
+        if len(s) > 2 and s[0] in 'ABCDEF' and s[1] in '.、．':
+            s = s[2:].strip()
+        elif len(s) > 3 and s[0] in 'ABCDEF' and s[1] == ' ':
+            s = s[2:].strip()
+        s = s.strip()
+        if s:
+            cleaned_list.append(s)
+        else:
+            # 剥完为空 = 该选项只有图片（内容在图里），保留占位防止误判"无选项"
+            letter = 'ABCDEF'[idx] if idx < 6 else str(idx + 1)
+            cleaned_list.append(f'（选项{letter}见配图）')
     return cleaned_list
 
 
@@ -1530,6 +2065,225 @@ def save_to_json(questions: list[dict[str, Any]], filepath: str) -> None:
         json.dump(structured, f, ensure_ascii=False, indent=2)
 
 
+# ---------------- 图片下载缓存 ----------------
+
+IMG_CACHE_DIR = DATA_DIR / "images"
+
+
+def _img_cache_path(url: str):
+    """按 URL 生成稳定的本地缓存路径。"""
+    import hashlib
+    from urllib.parse import urlparse
+    h = hashlib.md5(url.encode()).hexdigest()
+    ext = '.jpg'
+    try:
+        p = urlparse(url).path
+        if '.' in p.rsplit('/', 1)[-1]:
+            ext = '.' + p.rsplit('.', 1)[-1].lower()
+            if ext not in ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'):
+                ext = '.jpg'
+    except Exception:
+        pass
+    return IMG_CACHE_DIR / f"{h}{ext}"
+
+
+def _download_image(url: str, referer: str = 'https://www.kaoshibao.com/') -> str | None:
+    """下载题目图片到本地缓存，返回本地路径；失败返回 None。
+
+    考试宝的图挂在 up.zaixiankaoshi.com，可能需要 Referer，所以带上。
+    """
+    if not url or not url.startswith(('http://', 'https://')):
+        return None
+    IMG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    dest = _img_cache_path(url)
+    if dest.exists() and dest.stat().st_size > 0:
+        return str(dest)
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                          'AppleWebKit/537.36 (KHTML, like Gecko) '
+                          'Chrome/120.0.0.0 Safari/537.36',
+            'Referer': referer,
+        })
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = r.read()
+        if len(data) < 64:
+            return None
+        dest.write_bytes(data)
+        return str(dest)
+    except Exception as e:
+        logger.warning(f"图片下载失败 {url}: {e}")
+        return None
+
+
+def _prepare_images(questions, log_fn=None) -> int:
+    """批量下载所有题目图片，返回成功数量。"""
+    total = 0
+    seen = set()
+    for q in questions:
+        for key in ('图片', '解析图片'):
+            for im in q.get(key) or []:
+                url = im.get('src') if isinstance(im, dict) else im
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                if _download_image(url):
+                    total += 1
+        for group in q.get('选项图片') or []:
+            for im in group.get('images') or []:
+                url = im.get('src') if isinstance(im, dict) else im
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                if _download_image(url):
+                    total += 1
+    if log_fn and total:
+        log_fn(f"已下载 {total} 张题目配图")
+    return total
+
+
+def _clean_analysis(text: str) -> str:
+    """清理解析里的页面噪声：AI 声明、难度星级文字、按钮文案等。"""
+    if not text:
+        return ''
+    import re as _re
+    s = text
+    # 去掉 AI 声明整行
+    s = _re.sub(r'本解析由\s*AI\s*生成[，,]?\s*仅供参考[。.]?', '', s)
+    s = _re.sub(r'使用深度解题获取深度思考过程[。.]?', '', s)
+    # 去掉孤零零的「难」「度」「中」「易」行（难度星级被 OCR/DOM 拆成单字）
+    s = _re.sub(r'(?m)^\s*[难度中易]\s*$', '', s)
+    # 去掉重复空行
+    s = _re.sub(r'\n{3,}', '\n\n', s)
+    # 去掉「获取深度解题」等按钮残留
+    for w in ('获取深度解题', '深度解题', '关闭AI解析', '原解析', 'AI解析'):
+        s = s.replace(w, '')
+    return s.strip()
+
+
+def save_to_docx(questions: list[dict[str, Any]], filepath: str,
+                 title: str = '', log_fn=None) -> None:
+    """导出为 Word (.docx)，题目配图内嵌。
+
+    结构：
+      标题
+      每道题：序号 + 题型 + 题干（含图） + 选项 A~F + 正确答案 + 解析（含图）
+    """
+    from docx import Document
+    from docx.shared import Pt, Inches, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+
+    doc = Document()
+
+    # 中文字体
+    style = doc.styles['Normal']
+    style.font.name = '微软雅黑'
+    style.font.size = Pt(10.5)
+    style.element.rPr.rFonts.set(qn('w:eastAsia'), '微软雅黑')
+
+    if title:
+        h = doc.add_heading(title, level=0)
+        h.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    ok_imgs = 0
+    miss_imgs = 0
+
+    def add_images(img_list, indent=0.0):
+        nonlocal ok_imgs, miss_imgs
+        for im in img_list or []:
+            url = im.get('src') if isinstance(im, dict) else im
+            if not url:
+                continue
+            local = _download_image(url)
+            if not local:
+                miss_imgs += 1
+                p = doc.add_paragraph()
+                if indent:
+                    p.paragraph_format.left_indent = Inches(indent)
+                run = p.add_run(f'[图片下载失败: {url}]')
+                run.font.size = Pt(8)
+                run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+                continue
+            try:
+                w = im.get('w', 0) if isinstance(im, dict) else 0
+                # 按原始像素决定插入宽度，最大 5.5 英寸
+                width = Inches(5.5)
+                if w and w < 700:
+                    width = Inches(max(1.5, min(5.5, w / 96)))
+                p = doc.add_paragraph()
+                if indent:
+                    p.paragraph_format.left_indent = Inches(indent)
+                p.add_run().add_picture(local, width=width)
+                ok_imgs += 1
+            except Exception as e:
+                logger.warning(f"插入图片失败 {local}: {e}")
+                miss_imgs += 1
+
+    for q in questions:
+        # 题干行
+        p = doc.add_paragraph()
+        p.paragraph_format.space_before = Pt(10)
+        r = p.add_run(f"{q.get('序号', '')}. ")
+        r.bold = True
+        qtype = q.get('题目类型', '')
+        if qtype:
+            tr = p.add_run(f"【{qtype}】")
+            tr.font.size = Pt(9)
+            tr.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
+        p.add_run(q.get('题目', ''))
+
+        # 题干配图
+        add_images(q.get('图片'))
+
+        # 选项
+        opts = _normalize_options(q.get('选项', []))
+        opt_imgs = {}
+        for group in q.get('选项图片') or []:
+            opt_imgs[group.get('index')] = group.get('images') or []
+        letters = 'ABCDEFGHIJ'
+        for i, opt in enumerate(opts):
+            op = doc.add_paragraph()
+            op.paragraph_format.left_indent = Inches(0.3)
+            op.paragraph_format.space_after = Pt(2)
+            op.add_run(f"{letters[i] if i < len(letters) else i + 1}. {opt}")
+            if i in opt_imgs:
+                add_images(opt_imgs[i], indent=0.45)
+
+        # 答案
+        ans = q.get('正确答案', '')
+        if ans:
+            ap = doc.add_paragraph()
+            ap.paragraph_format.left_indent = Inches(0.3)
+            ar = ap.add_run(f"正确答案：{ans}")
+            ar.bold = True
+            ar.font.color.rgb = RGBColor(0xC0, 0x00, 0x00)
+
+        # 解析
+        anal = _clean_analysis(q.get('解析') or '')
+        if anal:
+            anp = doc.add_paragraph()
+            anp.paragraph_format.left_indent = Inches(0.3)
+            anr = anp.add_run("解析：")
+            anr.bold = True
+            anr.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
+            anp.add_run(anal)
+        add_images(q.get('解析图片'), indent=0.3)
+
+        # 分隔线
+        sep = doc.add_paragraph()
+        sep.paragraph_format.space_after = Pt(4)
+        sr = sep.add_run('─' * 40)
+        sr.font.size = Pt(8)
+        sr.font.color.rgb = RGBColor(0xDD, 0xDD, 0xDD)
+
+    doc.save(filepath)
+    if log_fn:
+        log_fn(f"Word 导出完成：内嵌图片 {ok_imgs} 张"
+               + (f"，{miss_imgs} 张失败" if miss_imgs else ""))
+
+
 def export_questions(questions: list[dict[str, Any]], filepath: str, fmt: str = 'xlsx') -> None:
     """统一导出入口：根据格式调用对应保存函数"""
     fmt = (fmt or 'xlsx').lower()
@@ -1537,6 +2291,8 @@ def export_questions(questions: list[dict[str, Any]], filepath: str, fmt: str = 
         save_to_csv(questions, filepath)
     elif fmt == 'json':
         save_to_json(questions, filepath)
+    elif fmt in ('docx', 'word'):
+        save_to_docx(questions, filepath)
     else:
         save_to_excel(questions, filepath)
 
